@@ -17,7 +17,6 @@ import TransactionTable from "../components/transactions/TransactionTable";
 
 function Transactions() {
   const selectedProfile = storage.getSelectedProfile();
-
   const [filterType, setFilterType] = useState("today");
   const [monthlyRange, setMonthlyRange] = useState("3");
   const [startDate, setStartDate] = useState("");
@@ -29,150 +28,140 @@ function Transactions() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [error, setError] = useState("");
-  // const [infoMessage, setInfoMessage] = useState("");
   const [latestQueryId, setLatestQueryId] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
 
   const vpaId = selectedProfile?.vpa_id || "";
 
   const filteredRows = useMemo(() => {
     const keyword = search.trim().toLowerCase();
-
-    if (!keyword) {
-      return tableRows;
-    }
-
+    if (!keyword) return tableRows;
     return tableRows.filter((item) =>
-      String(item?.Transaction_Id || "")
-        .toLowerCase()
-        .includes(keyword)
+      String(item?.Transaction_Id || "").toLowerCase().includes(keyword)
     );
   }, [tableRows, search]);
 
-  const buildPayload = () => {
-    if (!vpaId) {
-      throw new Error("Selected VPA not found. Please login again.");
-    }
+  /**
+   * BUILD PAYLOAD
+   * Logic: Use "both" for UI visibility, "excel" for file-only requests
+   */
+  const buildPayload = (isDownloadAction = false) => {
+    if (!vpaId) throw new Error("VPA not found. Please re-login.");
 
+    let start, end;
     if (filterType === "today") {
-      const { startDate: todayStart, endDate: todayEnd } = getTodayRange();
-
-      return {
-        startDate: todayStart,
-        endDate: todayEnd,
-        vpa_id: vpaId,
-        mode: "both",
-      };
-    }
-
-    if (filterType === "monthly") {
-      const { startDate: monthStart, endDate: monthEnd } =
-        getLastMonthsRange(monthlyRange);
-
-      return {
-        startDate: monthStart,
-        endDate: monthEnd,
-        vpa_id: vpaId,
-        mode: "excel",
-      };
-    }
-
-    if (!startDate || !endDate) {
-      throw new Error("Please select start date and end date.");
-    }
-
-    if (isFutureDate(startDate) || isFutureDate(endDate)) {
-      throw new Error("Start date and end date cannot be in the future.");
-    }
-
-    if (isStartAfterEnd(startDate, endDate)) {
-      throw new Error("Start date cannot be greater than end date.");
+      const range = getTodayRange();
+      start = range.startDate;
+      end = range.endDate;
+    } else if (filterType === "monthly") {
+      const range = getLastMonthsRange(monthlyRange);
+      start = range.startDate;
+      end = range.endDate;
+    } else {
+      if (!startDate || !endDate) throw new Error("Please select start date and end date.");
+      if (isFutureDate(startDate) || isFutureDate(endDate)) throw new Error("Dates cannot be in the future.");
+      if (isStartAfterEnd(startDate, endDate)) throw new Error("Start date cannot be greater than end date.");
+      start = formatInputDateToDDMMYYYY(startDate);
+      end = formatInputDateToDDMMYYYY(endDate);
     }
 
     return {
-      startDate: formatInputDateToDDMMYYYY(startDate),
-      endDate: formatInputDateToDDMMYYYY(endDate),
+      startDate: start,
+      endDate: end,
       vpa_id: vpaId,
-      mode: "excel",
+      // For Submit button: always try "both" so table data is returned
+      // For Download button: use "excel" to ensure we get a fresh query_id for the file
+      mode: isDownloadAction ? "excel" : "both",
     };
   };
 
+  /**
+   * HANDLE SUBMIT (Populate UI Table)
+   */
   const handleSubmit = async () => {
     try {
       setIsSubmitting(true);
       setError("");
-      // setInfoMessage("");
+      setStatusMessage("");
+      setTableRows([]); // Reset table while loading
 
-      const payload = buildPayload();
+      const payload = buildPayload(false); // Mode: "both"
       const response = await submitTransactionReportQuery(payload);
 
-      if (payload.mode === "both" && Array.isArray(response?.data)) {
+      // Successfully received data for the table
+      if (response?.data && Array.isArray(response.data)) {
         setTableRows(response.data);
-        setLatestQueryId("");
         setCurrentPage(1);
-        // setInfoMessage(`Loaded ${response?.row_count || response.data.length} transactions successfully.`);
-        return;
-      }
+        
+        // Capture query_id for download if the server provides it in "both" mode
+        if (response.query_id) {
+            setLatestQueryId(response.query_id);
+        }
 
-      if (response?.query_id) {
+        if (response.data.length === 0) {
+            setError("No transactions found for the selected range.");
+        }
+      } 
+      // Fallback: If "both" only returns a query_id for large ranges
+      else if (response?.query_id) {
         setLatestQueryId(response.query_id);
-        setTableRows([]);
-        setCurrentPage(1);
-        // setInfoMessage(
-        //   "Report request submitted successfully. Click Download All when the file is ready."
-        // );
-        return;
+        setStatusMessage("Report is too large to display. Please click 'Download All' to view.");
       }
-
-      throw new Error("Unexpected response from report submission API.");
     } catch (err) {
-      setError(err.message || "Unable to submit report request.");
+      setError(err.statusDescription || err.message || "Unable to load transactions.");
     } finally {
       setIsSubmitting(false);
     }
   };
 
+  /**
+   * HANDLE DOWNLOAD ALL (Generate/Fetch Excel)
+   */
   const handleDownloadAll = async () => {
     try {
       setIsDownloading(true);
       setError("");
-      // setInfoMessage("");
+      
+      let queryId = latestQueryId;
 
-      if (!latestQueryId) {
-        throw new Error("No generated report found yet. Please submit Monthly or Custom Range first.");
+      // If no QueryId exists yet (e.g. user hasn't clicked Submit), 
+      // or we need a specific "excel" mode queryId
+      if (!queryId) {
+        const payload = buildPayload(true); // Forces mode: "excel"
+        const response = await submitTransactionReportQuery(payload);
+        queryId = response?.query_id;
+        setLatestQueryId(queryId);
       }
 
-      const response = await getTransactionReportStatus(latestQueryId);
-      const reportData = response?.data;
+      if (!queryId) throw new Error("Could not generate report query ID.");
 
-      if (!reportData) {
-        throw new Error("Invalid report status response.");
+      const statusResponse = await getTransactionReportStatus(queryId);
+      const report = statusResponse?.data;
+
+      if (report?.status === "READY" && report?.signed_url) {
+        // Cleaning URL as per previous requirements
+        const cleanUrl = report.signed_url.trim().split(',')[0];
+        window.open(cleanUrl, "_blank", "noopener,noreferrer");
+        setStatusMessage("Download started successfully.");
+      } else {
+        // If status is "PROCESSING" or "NOT_FOUND"
+        setStatusMessage(`Report status: ${report?.status || 'PREPARING'}. Please wait a moment and try again.`);
       }
-
-      if (reportData.status !== "READY") {
-        // setInfoMessage(`Report status: ${reportData.status || "Processing"}. Please try again in a moment.`);
-        return;
-      }
-
-      if (!reportData.signed_url) {
-        throw new Error("Download URL not available.");
-      }
-
-      window.open(reportData.signed_url.trim(), "_blank", "noopener,noreferrer");
-      // setInfoMessage("Report download started.");
     } catch (err) {
-      setError(err.message || "Unable to download report.");
+      setError(err.statusDescription || err.message || "Unable to download report.");
     } finally {
       setIsDownloading(false);
     }
   };
 
   return (
-    <div>
-      <h1 className="mb-4 text-[28px] font-semibold text-[#1f1f1f]">
+    <div className="p-4">
+      <h1 className="mb-6 text-[28px] font-bold text-[#1f1f1f]">
         Transaction Reports
       </h1>
 
-      <div className="space-y-4">
+      <div className="space-y-6">
+        {/* Filter Section */}
         <TransactionFilterCard
           filterType={filterType}
           monthlyRange={monthlyRange}
@@ -186,29 +175,27 @@ function Transactions() {
           isSubmitting={isSubmitting}
         />
 
-        {error ? (
-          <div className="rounded border border-red-200 bg-red-50 px-4 py-3 text-[13px] text-red-600">
-            {error}
+        {/* Dynamic Status / Error Messages */}
+        {(error || statusMessage) && (
+          <div className={`p-4 rounded-lg border text-[13px] ${
+            error ? 'bg-red-50 border-red-200 text-red-600' : 'bg-blue-50 border-blue-200 text-[#0b69c7]'
+          }`}>
+            {error || statusMessage}
           </div>
-        ) : null}
+        )}
 
-        {/* {infoMessage ? (
-          <div className="rounded border border-blue-200 bg-blue-50 px-4 py-3 text-[13px] text-[#0b69c7]">
-            {infoMessage}
-          </div>
-        ) : null} */}
-
-        <div className="rounded border border-[#e8e8e8] bg-white p-4">
-          <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        {/* Table & Search Section */}
+        <div className="bg-white rounded-lg border border-[#e8e8e8] shadow-sm overflow-hidden">
+          <div className="p-4 flex flex-col md:flex-row justify-between items-center gap-4 bg-gray-50/50 border-b border-[#e8e8e8]">
             <TransactionSearchBar value={search} onChange={setSearch} />
 
             <button
               type="button"
               onClick={handleDownloadAll}
               disabled={isDownloading}
-              className="self-start rounded bg-[#0b69c7] px-4 py-2 text-[12px] font-medium text-white disabled:cursor-not-allowed disabled:opacity-60"
+              className="bg-[#0b69c7] hover:bg-[#0956a3] text-white px-6 py-2.5 rounded text-[13px] font-semibold transition-all shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {isDownloading ? "Checking..." : "Download All"}
+              {isDownloading ? "Checking Status..." : "Download All"}
             </button>
           </div>
 
